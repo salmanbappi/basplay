@@ -17,9 +17,13 @@ import extensions.utils.get
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.IOException
@@ -35,83 +39,101 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
     override val client: OkHttpClient = network.client
 
-    // Popular = Trending Now section (Horizontal scroll)
-    override suspend fun getPopularAnime(page: Int): AnimesPage {
-        if (page > 1) return AnimesPage(emptyList(), false)
-        val response = client.newCall(GET(baseUrl)).execute()
-        val doc = response.asJsoup()
-        // Select items from the "Trending Now" section
-        val items = doc.select("div.trend-wrap a.trend-card")
-        val animeList = items.mapNotNull { item ->
-            val url = item.attr("href")
-            val title = item.selectFirst("div.cp-title")?.text() ?: item.attr("title") ?: ""
-            val imgSrc = item.selectFirst("img")?.attr("src") ?: item.selectFirst("img")?.attr("data-src")
+    private val cursorCache = mutableMapOf<Int, String>()
 
-            if (url.isNotEmpty() && title.isNotEmpty()) {
-                SAnime.create().apply {
-                    this.url = url
-                    this.title = title
-                    this.thumbnail_url = if (imgSrc != null) fixUrl(imgSrc) else null
-                }
-            } else null
-        }
-        return AnimesPage(animeList, false)
-    }
+    // Popular now mirrors Latest Updates to provide full content with infinite scroll
+    override suspend fun getPopularAnime(page: Int): AnimesPage = getLatestUpdates(page)
 
-    // Latest = Latest Uploads section (Grid)
+    // Latest Updates with Cursor-based Pagination
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
-        val response = client.newCall(GET(baseUrl)).execute()
-        val doc = response.asJsoup()
-        // Select items from the "Latest Uploads" grid
-        val items = doc.select("div#dateFeed a.cp-card")
-        return parseBasAnimeListItems(items)
+        if (page == 1) {
+            cursorCache.clear()
+            val response = client.newCall(GET(baseUrl)).execute()
+            val doc = response.asJsoup()
+            
+            // Extract initial cursor
+            val cursor = doc.selectFirst("#feedState")?.attr("data-cursor")
+            if (cursor != null) cursorCache[2] = cursor
+            
+            val items = doc.select("div#dateFeed a.cp-card")
+            return parseBasAnimeListItems(items, hasNextPage = cursor != null)
+        } else {
+            val cursor = cursorCache[page] ?: return AnimesPage(emptyList(), false)
+            val url = "$baseUrl/fetch_more.php?cursor=$cursor"
+            
+            val response = client.newCall(GET(url).newBuilder().addHeader("X-Requested-With", "fetch").build()).execute()
+            val jsonString = response.body.string()
+            
+            try {
+                val jsonObject = json.decodeFromString<JsonObject>(jsonString)
+                val html = jsonObject["html"]?.jsonPrimitive?.content ?: ""
+                val nextCursor = jsonObject["next_cursor"]?.jsonPrimitive?.contentOrNull
+                
+                if (!nextCursor.isNullOrBlank()) {
+                    cursorCache[page + 1] = nextCursor
+                }
+                
+                val doc = Jsoup.parseBodyFragment(html)
+                val items = doc.select("a.cp-card")
+                return parseBasAnimeListItems(items, hasNextPage = !nextCursor.isNullOrBlank())
+            } catch (e: Exception) {
+                return AnimesPage(emptyList(), false)
+            }
+        }
     }
 
+    // Search with Page-based Pagination
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        var url: String
+        
         if (query.isNotBlank()) {
-            val url = "$baseUrl/search.php?q=$query"
-            val response = client.newCall(GET(url)).execute()
-            val doc = response.asJsoup()
-            // Search results are simple links in a grid
-            val items = doc.select("div.grid a[href^='view.php'], div.grid a[href^='tview.php']")
-            return parseBasAnimeListItems(items, isSearch = true)
-        }
-
-        var category = ""
-        var isTv = false
-        filters.forEach { filter ->
-            when (filter) {
-                is MovieCategoryFilter -> {
-                    if (filter.toValue().isNotEmpty()) category = filter.toValue()
-                }
-                is TvCategoryFilter -> {
-                    if (filter.toValue().isNotEmpty()) {
-                        category = filter.toValue()
-                        isTv = true
+            url = "$baseUrl/search.php?q=$query"
+        } else {
+            var category = ""
+            var isTv = false
+            filters.forEach { filter ->
+                when (filter) {
+                    is MovieCategoryFilter -> {
+                        if (filter.toValue().isNotEmpty()) category = filter.toValue()
                     }
+                    is TvCategoryFilter -> {
+                        if (filter.toValue().isNotEmpty()) {
+                            category = filter.toValue()
+                            isTv = true
+                        }
+                    }
+                    else -> {}
                 }
-                else -> {}
+            }
+
+            url = if (isTv) {
+                "$baseUrl/tv.php?category=$category"
+            } else if (category.isNotEmpty()) {
+                "$baseUrl/category.php?category=$category"
+            } else {
+                baseUrl // Fallback to home if nothing selected
             }
         }
 
-        val url = if (isTv) {
-            "$baseUrl/tv.php?category=$category"
-        } else if (category.isNotEmpty()) {
-            "$baseUrl/category.php?category=$category"
-        } else {
-            baseUrl
-        }
+        // Append page parameter
+        val separator = if (url.contains("?")) "&" else "?"
+        url += "${separator}page=$page"
 
         val response = client.newCall(GET(url)).execute()
-        // Browse results are in a grid similar to Latest
         val doc = response.asJsoup()
-        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php']")
-        return parseBasAnimeListItems(items)
+        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php']")
+        
+        // Check for next page (Standard pagination usually has a 'Next' button or link)
+        // Or strictly check if we got items. Site seems to use 'Next' in nav.
+        val hasNextPage = doc.selectFirst("nav a:contains(Next), nav a[href*='page=${page + 1}']") != null
+        
+        return parseBasAnimeListItems(items, hasNextPage, isSearch = query.isNotBlank())
     }
 
-    private fun parseBasAnimeListItems(items: org.jsoup.select.Elements, isSearch: Boolean = false): AnimesPage {
+    private fun parseBasAnimeListItems(items: org.jsoup.select.Elements, hasNextPage: Boolean, isSearch: Boolean = false): AnimesPage {
         val seenUrls = mutableSetOf<String>()
         val animeList = mutableListOf<SAnime>()
+        // Regex to catch "Name S01E01" patterns
         val episodeRegex = Regex("""^(.*?) S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
 
         for (item in items) {
@@ -126,20 +148,16 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
             if (url.isBlank() || title.isBlank()) continue
 
-            // Fix for search results showing episodes: Convert to Series entry
-            if (isSearch) {
-                val match = episodeRegex.find(title)
-                if (match != null) {
-                    val seriesName = match.groupValues[1].trim()
-                    // If we found an episode, redirect to the Series page
-                    try {
-                        val encodedName = URLEncoder.encode(seriesName, "UTF-8")
-                        url = "tview.php?series=$encodedName"
-                        title = seriesName // Use clean series name
-                    } catch (e: Exception) {
-                        // Fallback to original if encoding fails
-                    }
-                }
+            // Convert Episode results to Series entries
+            // This applies to Search AND Latest Updates to prevent clutter
+            val match = episodeRegex.find(title)
+            if (match != null) {
+                val seriesName = match.groupValues[1].trim()
+                try {
+                    val encodedName = URLEncoder.encode(seriesName, "UTF-8")
+                    url = "tview.php?series=$encodedName"
+                    title = seriesName
+                } catch (e: Exception) {}
             }
 
             if (seenUrls.contains(url)) continue
@@ -151,7 +169,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                 this.thumbnail_url = if (imgSrc != null) fixUrl(imgSrc) else null
             })
         }
-        return AnimesPage(animeList, false)
+        return AnimesPage(animeList, hasNextPage)
     }
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
@@ -161,7 +179,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         return anime.apply {
             description = doc.selectFirst("p.leading-relaxed, p.text-slate-800")?.text()
             genre = doc.select("span.chip").joinToString { it.text() }
-            status = SAnime.COMPLETED // Default
+            status = SAnime.COMPLETED
             initialized = true
         }
     }
@@ -171,7 +189,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val doc = response.asJsoup()
         
         if (anime.url.contains("view.php")) {
-            // Movie - Single Episode
+            // Movie
             val videoLink = doc.selectFirst("a#dlBtn")?.attr("href")
                 ?: doc.selectFirst("a[href^='player.php']")?.attr("href")
                 ?: doc.selectFirst("video source")?.attr("src")
@@ -183,21 +201,16 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                 episode_number = 1F
             })
         } else {
-            // TV Series - Handle multiple seasons
+            // TV Series - Fetch All Seasons
             val episodes = mutableListOf<SEpisode>()
             
-            // 1. Parse current page (usually Season 1)
+            // 1. Parse current page
             parseEpisodesFromDoc(doc, episodes)
             
-            // 2. Check for Season Selector
+            // 2. Fetch other seasons
             val seasonOptions = doc.select("select#seasonSelect option")
             if (seasonOptions.size > 1) {
-                // If there are other seasons, we need to fetch them
-                // The current page is already parsed (usually the first option or selected option)
                 val currentSeason = doc.selectFirst("select#seasonSelect option[selected]")?.attr("value") ?: "1"
-                
-                // We need the series name to construct URLs
-                // It's usually in the URL: tview.php?series=Name
                 val seriesName = doc.selectFirst("h1.sec-title")?.text() ?: "Series"
                 val encodedSeries = URLEncoder.encode(seriesName, "UTF-8")
 
@@ -205,7 +218,6 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                     val seasonVal = opt.attr("value")
                     if (seasonVal != currentSeason) {
                         try {
-                            // Construct URL: tview.php?series=Name&season=Val
                             val seasonUrl = "$baseUrl/tview.php?series=$encodedSeries&season=$seasonVal"
                             val seasonDoc = client.newCall(GET(seasonUrl)).execute().asJsoup()
                             parseEpisodesFromDoc(seasonDoc, episodes)
@@ -216,7 +228,6 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                 }
             }
             
-            // Deduplicate and sort
             return episodes.distinctBy { it.url }.sortedByDescending { it.episode_number }
         }
     }
@@ -226,18 +237,19 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         epItems.forEach { element ->
             val epUrl = element.attr("data-src")
             val epNameRaw = element.selectFirst("div.text-sm")?.text() ?: element.text()
-            // Try to extract strict episode number from data-epnum, else use index or regex
             val epNum = element.attr("data-epnum").toFloatOrNull()
-            // Sometimes epNum is just relative index (1, 2, 3), we might want S*E* logic
-            // But usually the name contains "S01E04"
             
-            // Extract S and E for better ordering if possible
+            // S*E* Parsing for ordering
             val match = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE).find(epNameRaw)
             val finalEpNum = if (match != null) {
-                // Encode as Season.Episode (e.g. S1E4 -> 1.04) or just absolute count if you prefer
-                // Standard approach: use absolute or just keep what we found.
-                // Let's stick to the data-epnum if valid, else fallback
-                epNum ?: 0F
+                val season = match.groupValues[1].toInt()
+                val episode = match.groupValues[2].toInt()
+                // Format: 105 (Season 1 Episode 05) or just sequential
+                // For Aniyomi sorting, simple float is best. 
+                // Let's use Season.Episode logic: S1E5 -> 1.05? 
+                // No, standard is usually absolute.
+                // Let's rely on data-epnum if present, otherwise construct a float like S.E
+                if (epNum != null) epNum else "${season}.${episode}".toFloat()
             } else {
                 epNum ?: 0F
             }
@@ -247,7 +259,6 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                     this.name = epNameRaw
                     this.url = if (epUrl.startsWith("http") || epUrl.startsWith("/")) epUrl else "/$epUrl"
                     this.episode_number = finalEpNum
-                    this.date_upload = 0L // No date in list usually
                 })
             }
         }
@@ -259,9 +270,6 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         } else {
             "$baseUrl${if (episode.url.startsWith("/")) "" else "/"}${episode.url}"
         }
-        
-        // If it's a direct file link (MP4/MKV), just play it
-        // The new site uses data-src pointing to .mkv/.mp4 files directly
         return listOf(Video(url, "Direct", url))
     }
 
