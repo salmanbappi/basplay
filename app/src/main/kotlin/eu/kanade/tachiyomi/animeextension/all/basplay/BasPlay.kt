@@ -37,7 +37,14 @@ class BasPlay : Source(), ConfigurableAnimeSource {
     override val supportsLatest = true
     override val id: Long = 5181466391484419847L
 
-    override val client: OkHttpClient = network.client
+    override val client: OkHttpClient = network.client.newBuilder()
+        .addInterceptor { chain ->
+            val request = chain.request().newBuilder()
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .build()
+            chain.proceed(request)
+        }
+        .build()
 
     private val cursorCache = mutableMapOf<Int, String>()
 
@@ -50,7 +57,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             val doc = response.asJsoup()
             val cursor = doc.selectFirst("#feedState")?.attr("data-cursor")
             if (cursor != null) cursorCache[2] = cursor
-            val items = doc.select("div#dateFeed a.cp-card")
+            val items = doc.select("div#dateFeed a.cp-card, div#dateFeed div.date-block a")
             return parseBasAnimeListItems(items, hasNextPage = cursor != null)
         } else {
             val cursor = cursorCache[page] ?: return AnimesPage(emptyList(), false)
@@ -89,7 +96,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         url += "${separator}page=$page"
         val response = client.newCall(GET(url)).execute()
         val doc = response.asJsoup()
-        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php'], a.cp-card")
+        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php'], a.cp-card, a.bg-white/5")
         val hasNextPage = doc.selectFirst("nav a:contains(Next), nav a[href*='page=${page + 1}']") != null
         return parseBasAnimeListItems(items, hasNextPage)
     }
@@ -100,7 +107,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val episodeRegex = Regex("""^(.*?) S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
         for (item in items) {
             var url = item.attr("href")
-            var title = item.selectFirst("div.cp-title, h2, div.cap")?.text() ?: item.attr("title") ?: ""
+            var title = item.selectFirst("div.cp-title, h2, div.cap, div.cap-title")?.text() ?: item.attr("title") ?: ""
             if (url.isBlank() || title.isBlank()) continue
             val img = item.selectFirst("img")
             val imgSrc = img?.attr("src") ?: img?.attr("data-src")
@@ -108,7 +115,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             if (match != null) {
                 val seriesName = match.groupValues[1].trim()
                 try {
-                    val encodedName = URLEncoder.encode(seriesName, "UTF-8")
+                    val encodedName = URLEncoder.encode(seriesName, "UTF-8").replace("+", "%20")
                     url = "tview.php?series=$encodedName"
                     title = seriesName
                 } catch (e: Exception) {}
@@ -151,19 +158,23 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             })
         } else {
             val episodes = mutableListOf<SEpisode>()
-            parseEpisodesFromDoc(doc, episodes)
+            val currentSeasonAttr = doc.selectFirst("select#seasonSelect option[selected]")?.attr("value")
+            val currentSeasonVal = currentSeasonAttr?.toIntOrNull() ?: 1
+            
+            parseEpisodesFromDoc(doc, episodes, currentSeasonVal)
+            
             val seasonOptions = doc.select("select#seasonSelect option")
             if (seasonOptions.size > 1) {
-                val currentSeason = doc.selectFirst("select#seasonSelect option[selected]")?.attr("value") ?: "1"
                 val seriesName = doc.selectFirst("h1.sec-title")?.text() ?: "Series"
-                val encodedSeries = URLEncoder.encode(seriesName, "UTF-8")
+                val encodedSeries = URLEncoder.encode(seriesName, "UTF-8").replace("+", "%20")
                 seasonOptions.forEach { opt ->
-                    val seasonVal = opt.attr("value")
-                    if (seasonVal != currentSeason) {
+                    val seasonValAttr = opt.attr("value")
+                    val sVal = seasonValAttr.toIntOrNull() ?: 1
+                    if (sVal != currentSeasonVal) {
                         try {
-                            val seasonUrl = "$baseUrl/tview.php?series=$encodedSeries&season=$seasonVal"
+                            val seasonUrl = "$baseUrl/tview.php?series=$encodedSeries&season=$seasonValAttr"
                             val seasonDoc = client.newCall(GET(seasonUrl)).execute().asJsoup()
-                            parseEpisodesFromDoc(seasonDoc, episodes)
+                            parseEpisodesFromDoc(seasonDoc, episodes, sVal)
                         } catch (e: Exception) {}
                     }
                 }
@@ -172,18 +183,22 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         }
     }
 
-    private fun parseEpisodesFromDoc(doc: Document, targetList: MutableList<SEpisode>) {
+    private fun parseEpisodesFromDoc(doc: Document, targetList: MutableList<SEpisode>, seasonVal: Int) {
         val epItems = doc.select("a.ep-item")
-        epItems.forEach { element ->
+        epItems.forEachIndexed { index, element ->
             val epUrl = element.attr("data-src")
             val epNameRaw = element.selectFirst("div.text-sm")?.text() ?: element.text()
-            val epNum = element.attr("data-epnum").toFloatOrNull()
+            val epNumAttr = element.attr("data-epnum").toFloatOrNull() ?: (index + 1).toFloat()
+            
             val match = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE).find(epNameRaw)
             val finalEpNum = if (match != null) {
-                val season = match.groupValues[1].toInt()
-                val episode = match.groupValues[2].toInt()
-                if (epNum != null) epNum else (season * 1000 + episode).toFloat()
-            } else { epNum ?: 0F }
+                val s = match.groupValues[1].toInt()
+                val e = match.groupValues[2].toInt()
+                (s * 1000 + e).toFloat()
+            } else {
+                (seasonVal * 1000).toFloat() + epNumAttr
+            }
+            
             if (epUrl.isNotBlank()) {
                 targetList.add(SEpisode.create().apply {
                     this.name = epNameRaw
