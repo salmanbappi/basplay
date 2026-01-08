@@ -7,7 +7,7 @@
         android:label="${appName}"
         android:roundIcon="@drawable/ic_launcher"
         android:supportsRtl="true"
-        tools:replace="android:allowBackup">
+        tools:replace="android:allowBackup,android:icon">
         <meta-data
             android:name="tachiyomi.animeextension.class"
             android:value="${extClass}" />
