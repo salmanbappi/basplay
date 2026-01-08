@@ -41,7 +41,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
     private val cursorCache = mutableMapOf<Int, String>()
 
-    // Popular now mirrors Latest Updates to provide full content with infinite scroll
+    // Popular mirrors Latest to show full content
     override suspend fun getPopularAnime(page: Int): AnimesPage = getLatestUpdates(page)
 
     // Latest Updates with Cursor-based Pagination
@@ -119,7 +119,8 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
         val response = client.newCall(GET(url)).execute()
         val doc = response.asJsoup()
-        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php']")
+        // Broad selector to capture items in Search and Category layouts
+        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php'], a.cp-card")
         
         val hasNextPage = doc.selectFirst("nav a:contains(Next), nav a[href*='page=${page + 1}']") != null
         
@@ -133,7 +134,8 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
         for (item in items) {
             var url = item.attr("href")
-            var title = item.selectFirst("div.cp-title")?.text() 
+            // title selector updated to include h2 for search results
+            var title = item.selectFirst("div.cp-title, h2, div.cap")?.text() 
                 ?: item.selectFirst("h2")?.text()
                 ?: item.attr("title")
                 ?: ""
@@ -143,7 +145,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
             if (url.isBlank() || title.isBlank()) continue
 
-            // Convert Episode results to Series entries
+            // Convert Episode -> Series
             val match = episodeRegex.find(title)
             if (match != null) {
                 val seriesName = match.groupValues[1].trim()
@@ -182,6 +184,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val response = client.newCall(GET("$baseUrl/${anime.url}")).execute()
         val doc = response.asJsoup()
         
+        // Treat as Movie ONLY if it lacks 'tview.php'
         val isMovie = anime.url.contains("view.php") && !anime.url.contains("tview.php")
         
         if (isMovie) {
@@ -197,7 +200,6 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             })
         } else {
             val episodes = mutableListOf<SEpisode>()
-            
             parseEpisodesFromDoc(doc, episodes)
             
             val seasonOptions = doc.select("select#seasonSelect option")
@@ -213,13 +215,10 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                             val seasonUrl = "$baseUrl/tview.php?series=$encodedSeries&season=$seasonVal"
                             val seasonDoc = client.newCall(GET(seasonUrl)).execute().asJsoup()
                             parseEpisodesFromDoc(seasonDoc, episodes)
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
+                        } catch (e: Exception) {}
                     }
                 }
             }
-            
             return episodes.distinctBy { it.url }.sortedByDescending { it.episode_number }
         }
     }
@@ -235,7 +234,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             val finalEpNum = if (match != null) {
                 val season = match.groupValues[1].toInt()
                 val episode = match.groupValues[2].toInt()
-                if (epNum != null) epNum else "${season}.${episode}".toFloat()
+                if (epNum != null) epNum else (season * 1000 + episode).toFloat()
             } else {
                 epNum ?: 0F
             }
@@ -256,9 +255,8 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         } else {
             "$baseUrl${if (episode.url.startsWith("/")) "" else "/"}${episode.url}"
         }
-        
+        // Encode spaces and ampersands
         val url = rawUrl.replace(" ", "%20").replace("&", "%26")
-        
         return listOf(Video(url, "Direct", url))
     }
 
