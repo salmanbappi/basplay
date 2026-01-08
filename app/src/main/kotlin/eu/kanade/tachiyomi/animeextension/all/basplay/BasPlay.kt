@@ -23,6 +23,7 @@ import kotlinx.serialization.json.Json
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.IOException
+import java.net.URLEncoder
 
 class BasPlay : Source(), ConfigurableAnimeSource {
 
@@ -34,17 +35,17 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
     override val client: OkHttpClient = network.client
 
-    // Popular = Hero Slider items
+    // Popular = Trending Now section (Horizontal scroll)
     override suspend fun getPopularAnime(page: Int): AnimesPage {
         if (page > 1) return AnimesPage(emptyList(), false)
         val response = client.newCall(GET(baseUrl)).execute()
         val doc = response.asJsoup()
-        val items = doc.select("div.vs-card")
+        // Select items from the "Trending Now" section
+        val items = doc.select("div.trend-wrap a.trend-card")
         val animeList = items.mapNotNull { item ->
-            val link = item.closest("a") ?: return@mapNotNull null
-            val url = link.attr("href")
-            val title = item.selectFirst("div.cap")?.text() ?: ""
-            val imgSrc = item.selectFirst("img")?.attr("src")
+            val url = item.attr("href")
+            val title = item.selectFirst("div.cp-title")?.text() ?: item.attr("title") ?: ""
+            val imgSrc = item.selectFirst("img")?.attr("src") ?: item.selectFirst("img")?.attr("data-src")
 
             if (url.isNotEmpty() && title.isNotEmpty()) {
                 SAnime.create().apply {
@@ -57,18 +58,23 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         return AnimesPage(animeList, false)
     }
 
-    // Latest = Latest Uploads section
+    // Latest = Latest Uploads section (Grid)
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
-        // The site uses fetch_more.php?cursor=... for pagination, but for now let's just get page 1 from index
         val response = client.newCall(GET(baseUrl)).execute()
-        return parseBasAnimeList(response.asJsoup())
+        val doc = response.asJsoup()
+        // Select items from the "Latest Uploads" grid
+        val items = doc.select("div#dateFeed a.cp-card")
+        return parseBasAnimeListItems(items)
     }
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         if (query.isNotBlank()) {
             val url = "$baseUrl/search.php?q=$query"
             val response = client.newCall(GET(url)).execute()
-            return parseBasAnimeList(response.asJsoup())
+            val doc = response.asJsoup()
+            // Search results are simple links in a grid
+            val items = doc.select("div.grid a[href^='view.php'], div.grid a[href^='tview.php']")
+            return parseBasAnimeListItems(items, isSearch = true)
         }
 
         var category = ""
@@ -97,20 +103,20 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         }
 
         val response = client.newCall(GET(url)).execute()
-        return parseBasAnimeList(response.asJsoup())
+        // Browse results are in a grid similar to Latest
+        val doc = response.asJsoup()
+        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php']")
+        return parseBasAnimeListItems(items)
     }
 
-    private fun parseBasAnimeList(document: Document): AnimesPage {
-        val items = document.select("div.cp-card, div.grid a[href^='view.php']")
+    private fun parseBasAnimeListItems(items: org.jsoup.select.Elements, isSearch: Boolean = false): AnimesPage {
         val seenUrls = mutableSetOf<String>()
-        val animeList = items.mapNotNull { item ->
-            val url = if (item.tagName() == "a") item.attr("href") else item.closest("a")?.attr("href") ?: item.selectFirst("a")?.attr("href") ?: ""
-            if (url.isBlank() || seenUrls.contains(url)) return@mapNotNull null
-            
-            // Skip slider items if we're parsing from home
-            if (item.parents().any { it.hasClass("vs-track") }) return@mapNotNull null
+        val animeList = mutableListOf<SAnime>()
+        val episodeRegex = Regex("""^(.*?) S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
 
-            val title = item.selectFirst("div.cp-title")?.text() 
+        for (item in items) {
+            var url = item.attr("href")
+            var title = item.selectFirst("div.cp-title")?.text() 
                 ?: item.selectFirst("h2")?.text()
                 ?: item.attr("title")
                 ?: ""
@@ -118,16 +124,33 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             val img = item.selectFirst("img")
             val imgSrc = img?.attr("src") ?: img?.attr("data-src")
 
-            if (title.isNotEmpty()) {
-                seenUrls.add(url)
-                SAnime.create().apply {
-                    this.url = url
-                    this.title = title
-                    this.thumbnail_url = if (imgSrc != null) fixUrl(imgSrc) else null
+            if (url.isBlank() || title.isBlank()) continue
+
+            // Fix for search results showing episodes: Convert to Series entry
+            if (isSearch) {
+                val match = episodeRegex.find(title)
+                if (match != null) {
+                    val seriesName = match.groupValues[1].trim()
+                    // If we found an episode, redirect to the Series page
+                    try {
+                        val encodedName = URLEncoder.encode(seriesName, "UTF-8")
+                        url = "tview.php?series=$encodedName"
+                        title = seriesName // Use clean series name
+                    } catch (e: Exception) {
+                        // Fallback to original if encoding fails
+                    }
                 }
-            } else null
+            }
+
+            if (seenUrls.contains(url)) continue
+            seenUrls.add(url)
+
+            animeList.add(SAnime.create().apply {
+                this.url = url
+                this.title = title
+                this.thumbnail_url = if (imgSrc != null) fixUrl(imgSrc) else null
+            })
         }
-        // Site pagination is a bit complex with 'cursor', for now supports only first page or search results
         return AnimesPage(animeList, false)
     }
 
@@ -136,15 +159,9 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val doc = response.asJsoup()
         
         return anime.apply {
-            if (anime.url.startsWith("view.php")) {
-                description = doc.selectFirst("p.leading-relaxed")?.text()
-                genre = doc.select("div.flex.flex-wrap.items-center.gap-3 span").joinToString { it.text() }
-                status = SAnime.COMPLETED
-            } else {
-                // TV Series details from tview.php or tv.php
-                description = doc.selectFirst("p.text-slate-800")?.text() ?: doc.selectFirst("p.leading-relaxed")?.text()
-                genre = doc.select("span.chip").joinToString { it.text() }
-            }
+            description = doc.selectFirst("p.leading-relaxed, p.text-slate-800")?.text()
+            genre = doc.select("span.chip").joinToString { it.text() }
+            status = SAnime.COMPLETED // Default
             initialized = true
         }
     }
@@ -153,49 +170,86 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val response = client.newCall(GET("$baseUrl/${anime.url}")).execute()
         val doc = response.asJsoup()
         
-        if (anime.url.startsWith("view.php")) {
-            // Movie
-            val videoLink = doc.selectFirst("a.cta[href^='player.php']")?.attr("href")
-                ?: doc.selectFirst("a.btn-primary[href^='download.php']")?.attr("href")
+        if (anime.url.contains("view.php")) {
+            // Movie - Single Episode
+            val videoLink = doc.selectFirst("a#dlBtn")?.attr("href")
+                ?: doc.selectFirst("a[href^='player.php']")?.attr("href")
+                ?: doc.selectFirst("video source")?.attr("src")
                 ?: anime.url
             
             return listOf(SEpisode.create().apply {
                 name = "Play Movie"
-                this.url = videoLink
+                this.url = videoLink ?: anime.url
                 episode_number = 1F
             })
         } else {
-            // TV Series
+            // TV Series - Handle multiple seasons
             val episodes = mutableListOf<SEpisode>()
-            val epItems = doc.select("a.ep-item")
             
-            // If multiple seasons exist, we might only be seeing one.
-            // But for simplicity, let's parse what's on the page.
-            epItems.forEachIndexed { index, element ->
-                val epUrl = element.attr("data-src")
-                val epName = element.selectFirst("div.text-sm")?.text() ?: "Episode ${index + 1}"
-                val epNum = element.attr("data-epnum").toFloatOrNull() ?: (index + 1).toFloat()
+            // 1. Parse current page (usually Season 1)
+            parseEpisodesFromDoc(doc, episodes)
+            
+            // 2. Check for Season Selector
+            val seasonOptions = doc.select("select#seasonSelect option")
+            if (seasonOptions.size > 1) {
+                // If there are other seasons, we need to fetch them
+                // The current page is already parsed (usually the first option or selected option)
+                val currentSeason = doc.selectFirst("select#seasonSelect option[selected]")?.attr("value") ?: "1"
                 
-                episodes.add(SEpisode.create().apply {
-                    this.name = epName
-                    this.url = if (epUrl.startsWith("/")) epUrl else "/$epUrl" // Ensure absolute-ish path
-                    this.episode_number = epNum
-                })
-            }
-            
-            if (episodes.isEmpty()) {
-                // Fallback for some series layouts
-                val videoLink = doc.selectFirst("video source")?.attr("src")
-                if (videoLink != null) {
-                    episodes.add(SEpisode.create().apply {
-                        name = "Play"
-                        this.url = videoLink
-                        episode_number = 1F
-                    })
+                // We need the series name to construct URLs
+                // It's usually in the URL: tview.php?series=Name
+                val seriesName = doc.selectFirst("h1.sec-title")?.text() ?: "Series"
+                val encodedSeries = URLEncoder.encode(seriesName, "UTF-8")
+
+                seasonOptions.forEach { opt ->
+                    val seasonVal = opt.attr("value")
+                    if (seasonVal != currentSeason) {
+                        try {
+                            // Construct URL: tview.php?series=Name&season=Val
+                            val seasonUrl = "$baseUrl/tview.php?series=$encodedSeries&season=$seasonVal"
+                            val seasonDoc = client.newCall(GET(seasonUrl)).execute().asJsoup()
+                            parseEpisodesFromDoc(seasonDoc, episodes)
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
                 }
             }
             
-            return episodes.reversed()
+            // Deduplicate and sort
+            return episodes.distinctBy { it.url }.sortedByDescending { it.episode_number }
+        }
+    }
+
+    private fun parseEpisodesFromDoc(doc: Document, targetList: MutableList<SEpisode>) {
+        val epItems = doc.select("a.ep-item")
+        epItems.forEach { element ->
+            val epUrl = element.attr("data-src")
+            val epNameRaw = element.selectFirst("div.text-sm")?.text() ?: element.text()
+            // Try to extract strict episode number from data-epnum, else use index or regex
+            val epNum = element.attr("data-epnum").toFloatOrNull()
+            // Sometimes epNum is just relative index (1, 2, 3), we might want S*E* logic
+            // But usually the name contains "S01E04"
+            
+            // Extract S and E for better ordering if possible
+            val match = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE).find(epNameRaw)
+            val finalEpNum = if (match != null) {
+                // Encode as Season.Episode (e.g. S1E4 -> 1.04) or just absolute count if you prefer
+                // Standard approach: use absolute or just keep what we found.
+                // Let's stick to the data-epnum if valid, else fallback
+                epNum ?: 0F
+            } else {
+                epNum ?: 0F
+            }
+
+            if (epUrl.isNotBlank()) {
+                targetList.add(SEpisode.create().apply {
+                    this.name = epNameRaw
+                    this.url = if (epUrl.startsWith("http") || epUrl.startsWith("/")) epUrl else "/$epUrl"
+                    this.episode_number = finalEpNum
+                    this.date_upload = 0L // No date in list usually
+                })
+            }
         }
     }
 
@@ -206,16 +260,8 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             "$baseUrl${if (episode.url.startsWith("/")) "" else "/"}${episode.url}"
         }
         
-        if (url.contains("player.php")) {
-            val response = client.newCall(GET(url)).execute()
-            val doc = response.asJsoup()
-            val videoSrc = doc.selectFirst("video source")?.attr("src")
-            if (videoSrc != null) {
-                val finalUrl = if (videoSrc.startsWith("http")) videoSrc else "$baseUrl${if (videoSrc.startsWith("/")) "" else "/"}$videoSrc"
-                return listOf(Video(finalUrl, "Direct", finalUrl))
-            }
-        }
-        
+        // If it's a direct file link (MP4/MKV), just play it
+        // The new site uses data-src pointing to .mkv/.mp4 files directly
         return listOf(Video(url, "Direct", url))
     }
 
