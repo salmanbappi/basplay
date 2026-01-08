@@ -96,7 +96,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         url += "${separator}page=$page"
         val response = client.newCall(GET(url)).execute()
         val doc = response.asJsoup()
-        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php'], a.cp-card, a.bg-white/5")
+        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php'], a.cp-card, a[class*='bg-white/5']")
         val hasNextPage = doc.selectFirst("nav a:contains(Next), nav a[href*='page=${page + 1}']") != null
         return parseBasAnimeListItems(items, hasNextPage)
     }
@@ -107,6 +107,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val episodeRegex = Regex("""^(.*?) S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
         for (item in items) {
             var url = item.attr("href")
+            // title selector robust order
             var title = item.selectFirst("div.cp-title, h2, div.cap, div.cap-title")?.text() ?: item.attr("title") ?: ""
             if (url.isBlank() || title.isBlank()) continue
             val img = item.selectFirst("img")
