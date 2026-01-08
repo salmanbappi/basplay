@@ -30,7 +30,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
     override val baseUrl = "http://103.87.212.46"
     override val lang = "all"
     override val supportsLatest = true
-    override val id: Long = 72193058274619123L // Randomly generated stable ID
+    override val id: Long = 5181466391484419847L
 
     override val client: OkHttpClient = network.client
 

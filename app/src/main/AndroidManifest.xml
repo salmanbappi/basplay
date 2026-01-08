@@ -9,5 +9,8 @@
         <meta-data
             android:name="tachiyomi.animeextension.class"
             android:value="${extClass}" />
+        <meta-data
+            android:name="tachiyomi.animeextension.nsfw"
+            android:value="${nsfw}" />
     </application>
 </manifest>
