@@ -51,7 +51,6 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             val response = client.newCall(GET(baseUrl)).execute()
             val doc = response.asJsoup()
             
-            // Extract initial cursor
             val cursor = doc.selectFirst("#feedState")?.attr("data-cursor")
             if (cursor != null) cursorCache[2] = cursor
             
@@ -111,11 +110,10 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             } else if (category.isNotEmpty()) {
                 "$baseUrl/category.php?category=$category"
             } else {
-                baseUrl // Fallback to home if nothing selected
+                baseUrl
             }
         }
 
-        // Append page parameter
         val separator = if (url.contains("?")) "&" else "?"
         url += "${separator}page=$page"
 
@@ -123,17 +121,14 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val doc = response.asJsoup()
         val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php']")
         
-        // Check for next page (Standard pagination usually has a 'Next' button or link)
-        // Or strictly check if we got items. Site seems to use 'Next' in nav.
         val hasNextPage = doc.selectFirst("nav a:contains(Next), nav a[href*='page=${page + 1}']") != null
         
-        return parseBasAnimeListItems(items, hasNextPage, isSearch = query.isNotBlank())
+        return parseBasAnimeListItems(items, hasNextPage)
     }
 
-    private fun parseBasAnimeListItems(items: org.jsoup.select.Elements, hasNextPage: Boolean, isSearch: Boolean = false): AnimesPage {
+    private fun parseBasAnimeListItems(items: org.jsoup.select.Elements, hasNextPage: Boolean): AnimesPage {
         val seenUrls = mutableSetOf<String>()
         val animeList = mutableListOf<SAnime>()
-        // Regex to catch "Name S01E01" patterns
         val episodeRegex = Regex("""^(.*?) S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
 
         for (item in items) {
@@ -149,7 +144,6 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             if (url.isBlank() || title.isBlank()) continue
 
             // Convert Episode results to Series entries
-            // This applies to Search AND Latest Updates to prevent clutter
             val match = episodeRegex.find(title)
             if (match != null) {
                 val seriesName = match.groupValues[1].trim()
@@ -188,8 +182,9 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val response = client.newCall(GET("$baseUrl/${anime.url}")).execute()
         val doc = response.asJsoup()
         
-        if (anime.url.contains("view.php")) {
-            // Movie
+        val isMovie = anime.url.contains("view.php") && !anime.url.contains("tview.php")
+        
+        if (isMovie) {
             val videoLink = doc.selectFirst("a#dlBtn")?.attr("href")
                 ?: doc.selectFirst("a[href^='player.php']")?.attr("href")
                 ?: doc.selectFirst("video source")?.attr("src")
@@ -201,13 +196,10 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                 episode_number = 1F
             })
         } else {
-            // TV Series - Fetch All Seasons
             val episodes = mutableListOf<SEpisode>()
             
-            // 1. Parse current page
             parseEpisodesFromDoc(doc, episodes)
             
-            // 2. Fetch other seasons
             val seasonOptions = doc.select("select#seasonSelect option")
             if (seasonOptions.size > 1) {
                 val currentSeason = doc.selectFirst("select#seasonSelect option[selected]")?.attr("value") ?: "1"
@@ -239,16 +231,10 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             val epNameRaw = element.selectFirst("div.text-sm")?.text() ?: element.text()
             val epNum = element.attr("data-epnum").toFloatOrNull()
             
-            // S*E* Parsing for ordering
             val match = Regex("""S(\d+)E(\d+)""", RegexOption.IGNORE_CASE).find(epNameRaw)
             val finalEpNum = if (match != null) {
                 val season = match.groupValues[1].toInt()
                 val episode = match.groupValues[2].toInt()
-                // Format: 105 (Season 1 Episode 05) or just sequential
-                // For Aniyomi sorting, simple float is best. 
-                // Let's use Season.Episode logic: S1E5 -> 1.05? 
-                // No, standard is usually absolute.
-                // Let's rely on data-epnum if present, otherwise construct a float like S.E
                 if (epNum != null) epNum else "${season}.${episode}".toFloat()
             } else {
                 epNum ?: 0F
@@ -265,11 +251,14 @@ class BasPlay : Source(), ConfigurableAnimeSource {
     }
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val url = if (episode.url.startsWith("http")) {
+        val rawUrl = if (episode.url.startsWith("http")) {
             episode.url
         } else {
             "$baseUrl${if (episode.url.startsWith("/")) "" else "/"}${episode.url}"
         }
+        
+        val url = rawUrl.replace(" ", "%20").replace("&", "%26")
+        
         return listOf(Video(url, "Direct", url))
     }
 
