@@ -12,8 +12,8 @@ android {
         applicationId = "eu.kanade.tachiyomi.animeextension.all.basplay"
         minSdk = 21
         targetSdk = 34
-        versionCode = 1425
-        versionName = "14.1425"
+        versionCode = 1426
+        versionName = "14.1426"
 
         manifestPlaceholders = [
             appName: "Bas play",
