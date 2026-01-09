@@ -24,6 +24,11 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.IOException
@@ -57,7 +62,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             val doc = response.asJsoup()
             val cursor = doc.selectFirst("#feedState")?.attr("data-cursor")
             if (cursor != null) cursorCache[2] = cursor
-            val items = doc.select("div#dateFeed a.cp-card, div#dateFeed div.date-block a")
+            val items = doc.select("div#dateFeed a.cp-card, div#dateFeed div.date-block a").take(30)
             return parseBasAnimeListItems(items, hasNextPage = cursor != null)
         } else {
             val cursor = cursorCache[page] ?: return AnimesPage(emptyList(), false)
@@ -69,7 +74,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                 val nextCursor = jsonObject["next_cursor"]?.jsonPrimitive?.contentOrNull
                 if (!nextCursor.isNullOrBlank()) cursorCache[page + 1] = nextCursor
                 val doc = Jsoup.parseBodyFragment(html)
-                val items = doc.select("a.cp-card")
+                val items = doc.select("a.cp-card").take(30)
                 return parseBasAnimeListItems(items, hasNextPage = !nextCursor.isNullOrBlank())
             } catch (e: Exception) {
                 return AnimesPage(emptyList(), false)
@@ -96,12 +101,12 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         url += "${separator}page=$page"
         val response = client.newCall(GET(url)).execute()
         val doc = response.asJsoup()
-        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php'], a.cp-card, a[class*='bg-white/5']")
+        val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php'], a.cp-card, a[class*='bg-white/5']").take(30)
         val hasNextPage = doc.selectFirst("nav a:contains(Next), nav a[href*='page=${page + 1}']") != null
         return parseBasAnimeListItems(items, hasNextPage)
     }
 
-    private fun parseBasAnimeListItems(items: org.jsoup.select.Elements, hasNextPage: Boolean): AnimesPage {
+    private fun parseBasAnimeListItems(items: List<Element>, hasNextPage: Boolean): AnimesPage {
         val seenUrls = mutableSetOf<String>()
         val animeList = mutableListOf<SAnime>()
         val episodeRegex = Regex("""^(.*?) S(\d+)E(\d+)""", RegexOption.IGNORE_CASE)
@@ -168,15 +173,27 @@ class BasPlay : Source(), ConfigurableAnimeSource {
             if (seasonOptions.size > 1) {
                 val seriesName = doc.selectFirst("h1.sec-title")?.text() ?: "Series"
                 val encodedSeries = URLEncoder.encode(seriesName, "UTF-8").replace("+", "%20")
-                seasonOptions.forEach { opt ->
+                
+                val otherSeasons = seasonOptions.mapNotNull { opt ->
                     val seasonValAttr = opt.attr("value")
                     val sVal = seasonValAttr.toIntOrNull() ?: 1
                     if (sVal != currentSeasonVal) {
-                        try {
-                            val seasonUrl = "$baseUrl/tview.php?series=$encodedSeries&season=$seasonValAttr"
-                            val seasonDoc = client.newCall(GET(seasonUrl)).execute().asJsoup()
-                            parseEpisodesFromDoc(seasonDoc, episodes, sVal)
-                        } catch (e: Exception) {}
+                        "$baseUrl/tview.php?series=$encodedSeries&season=$seasonValAttr" to sVal
+                    } else null
+                }
+
+                if (otherSeasons.isNotEmpty()) {
+                    withContext(Dispatchers.IO) {
+                        otherSeasons.map { (url, sVal) ->
+                            async {
+                                try {
+                                    val seasonDoc = client.newCall(GET(url)).execute().asJsoup()
+                                    synchronized(episodes) {
+                                        parseEpisodesFromDoc(seasonDoc, episodes, sVal)
+                                    }
+                                } catch (e: Exception) {}
+                            }
+                        }.awaitAll()
                     }
                 }
             }
