@@ -59,7 +59,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         if (page == 1) {
             cursorCache.clear()
             val response = client.newCall(GET(baseUrl)).execute()
-            val doc = response.asJsoup() as Element
+            val doc = response.asJsoup()
             val cursor = doc.selectFirst("#feedState")?.attr("data-cursor")
             if (cursor != null) cursorCache[2] = cursor
             val items = doc.select("div#dateFeed a.cp-card, div#dateFeed div.date-block a").take(30)
@@ -73,7 +73,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                 val html = jsonObject["html"]?.jsonPrimitive?.content ?: ""
                 val nextCursor = jsonObject["next_cursor"]?.jsonPrimitive?.contentOrNull
                 if (!nextCursor.isNullOrBlank()) cursorCache[page + 1] = nextCursor
-                val doc = Jsoup.parseBodyFragment(html) as Element
+                val doc = Jsoup.parseBodyFragment(html)
                 val items = doc.select("a.cp-card").take(30)
                 return parseBasAnimeListItems(items, hasNextPage = !nextCursor.isNullOrBlank())
             } catch (e: Exception) {
@@ -100,7 +100,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         val separator = if (url.contains("?")) "&" else "?"
         url += "${separator}page=$page"
         val response = client.newCall(GET(url)).execute()
-        val doc = response.asJsoup() as Element
+        val doc = response.asJsoup()
         val items = doc.select("div.grid a.cp-card, div.grid a[href^='view.php'], div.grid a[href^='tview.php'], a.cp-card, a[class*='bg-white/5']").take(30)
         val hasNextPage = doc.selectFirst("nav a:contains(Next), nav a[href*='page=${page + 1}']") != null
         return parseBasAnimeListItems(items, hasNextPage)
@@ -139,7 +139,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
         val response = client.newCall(GET("$baseUrl/${anime.url}")).execute()
-        val doc = response.asJsoup() as Element
+        val doc = response.asJsoup()
         return anime.apply {
             description = doc.selectFirst("p.leading-relaxed, p.text-slate-800")?.text()
             genre = doc.select("span.chip").joinToString { it.text() }
@@ -150,7 +150,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         val response = client.newCall(GET("$baseUrl/${anime.url}")).execute()
-        val doc = response.asJsoup() as Element
+        val doc = response.asJsoup()
         val isMovie = anime.url.contains("view.php") && !anime.url.contains("tview.php")
         if (isMovie) {
             val videoLink = doc.selectFirst("a#dlBtn")?.attr("href")
@@ -187,7 +187,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
                         otherSeasons.map { (url, sVal) ->
                             async {
                                 try {
-                                    val seasonDoc = client.newCall(GET(url)).execute().asJsoup() as Element
+                                    val seasonDoc = client.newCall(GET(url)).execute().asJsoup()
                                     synchronized(episodes) {
                                         parseEpisodesFromDoc(seasonDoc, episodes, sVal)
                                     }
@@ -201,7 +201,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         }
     }
 
-    private fun parseEpisodesFromDoc(doc: Element, targetList: MutableList<SEpisode>, seasonVal: Int) {
+    private fun parseEpisodesFromDoc(doc: Document, targetList: MutableList<SEpisode>, seasonVal: Int) {
         val epItems = doc.select("a.ep-item")
         epItems.forEachIndexed { index, element ->
             val epUrl = element.attr("data-src")
@@ -231,7 +231,7 @@ class BasPlay : Source(), ConfigurableAnimeSource {
         var url = if (episode.url.startsWith("http")) episode.url else fixUrl(episode.url)
         if (url.contains("player.php")) {
             val response = client.newCall(GET(url)).execute()
-            val doc = response.asJsoup() as Element
+            val doc = response.asJsoup()
             val videoSrc = doc.selectFirst("video source")?.attr("src")
             if (videoSrc != null) url = fixUrl(videoSrc)
         }
